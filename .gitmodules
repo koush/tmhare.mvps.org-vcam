@@ -1,0 +1,4 @@
+[submodule "Windows-classic-samples"]
+	path = Windows-classic-samples
+	url = https://github.com/roman380/Windows-classic-samples.git
+	branch = directshow
