@@ -59,9 +59,10 @@ public:
 
     HRESULT FillBuffer(IMediaSample *pms);
     HRESULT DecideBufferSize(IMemAllocator *pIMemAlloc, ALLOCATOR_PROPERTIES *pProperties);
-    HRESULT CheckMediaType(const CMediaType *pMediaType);
-    HRESULT GetMediaType(int iPosition, CMediaType *pmt);
-    HRESULT SetMediaType(const CMediaType *pmt);
+    HRESULT GetMediaType(CMediaType *pmt);
+    //HRESULT CheckMediaType(const CMediaType *pMediaType);
+    //HRESULT GetMediaType(int iPosition, CMediaType *pmt);
+    //HRESULT SetMediaType(const CMediaType *pmt);
     HRESULT OnThreadCreate(void);
     
 private:
@@ -70,7 +71,8 @@ private:
     HBITMAP m_hLogoBmp;
     CCritSec m_cSharedState;
     IReferenceClock *m_pClock;
-
+    HANDLE m_pipe;
+    bool m_first;
 };
 
 
