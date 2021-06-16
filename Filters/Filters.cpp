@@ -1,6 +1,8 @@
 #pragma warning(disable:4244)
 #pragma warning(disable:4711)
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <streams.h>
 #include <stdio.h>
 #include <olectl.h>
@@ -46,7 +48,7 @@ HRESULT CVCam::QueryInterface(REFIID riid, void **ppv)
 //////////////////////////////////////////////////////////////////////////
 CVCamStream::CVCamStream(HRESULT *phr, CVCam *pParent, LPCWSTR pPinName) :
     CSourceStream(NAME("Virtual Cam"),phr, pParent, pPinName), m_pParent(pParent),
-    m_pipe(INVALID_HANDLE_VALUE), m_first(true)
+    m_pipe(INVALID_HANDLE_VALUE), m_first(true), m_socket(INVALID_SOCKET)
 {
     // Set the default media type as 320x240x24@15
     GetMediaType(&m_mt);
@@ -71,20 +73,31 @@ HRESULT CVCamStream::QueryInterface(REFIID riid, void **ppv)
 }
 
 
-static BOOLEAN ReadFully(HANDLE handle, void* buffer, int length) {
-    BOOL fSuccess;
-    DWORD amountRead;
-    int offset = 0;
-    while (offset != length) {
-        fSuccess = ReadFile(handle, (byte*)buffer + offset, length - offset, &amountRead, NULL);
-        if (!fSuccess && GetLastError() != ERROR_MORE_DATA) {
+BOOLEAN CVCamStream::ReadFully(void* buffer, int length) {
+    if (m_pipe != INVALID_HANDLE_VALUE) {
+        BOOL fSuccess;
+        DWORD amountRead;
+        int offset = 0;
+        while (offset != length) {
+            fSuccess = ReadFile(m_pipe, (byte*)buffer + offset, length - offset, &amountRead, NULL);
+            if (!fSuccess && GetLastError() != ERROR_MORE_DATA) {
+                return false;
+            }
+            if (fSuccess) {
+                offset += amountRead;
+            }
+        }
+        return true;
+    }
+    else if (m_socket != INVALID_SOCKET) {
+        DWORD amountRead = recv(m_socket, (char*)buffer, length, MSG_WAITALL);
+        if (amountRead != length) {
             return false;
         }
-        if (fSuccess) {
-            offset += amountRead;
-        }
+        return true;
     }
-    return true;
+
+    return false;
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -94,19 +107,53 @@ static BOOLEAN ReadFully(HANDLE handle, void* buffer, int length) {
 
 HRESULT CVCamStream::FillBuffer(IMediaSample *pms)
 {
-    if (m_pipe == INVALID_HANDLE_VALUE) {
-        m_pipe = CreateFileA("\\\\.\\pipe\\vysor-camera", GENERIC_READ | GENERIC_WRITE,
-            0, NULL, OPEN_EXISTING, 0, NULL);
-        if (m_pipe == INVALID_HANDLE_VALUE) {
-            return ERROR_RETRY;
-        }
-        DWORD dwMode = PIPE_READMODE_MESSAGE;
+    if (m_pipe == INVALID_HANDLE_VALUE && m_socket == INVALID_SOCKET) {
+        WSADATA wsaData;
+        int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+        struct addrinfo* result = NULL, hints;
 
-        SetNamedPipeHandleState(
-            m_pipe,    // pipe handle 
-            &dwMode,  // new pipe mode 
-            NULL,     // don't set maximum bytes 
-            NULL);    // don't set maximum time
+        if (iResult != 0) {
+            printf("WSAStartup failed with error: %d\n", iResult);
+            return ERROR;
+        }
+
+
+        ZeroMemory(&hints, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+
+        // Resolve the server address and port
+        iResult = getaddrinfo("127.0.0.1", "53520", &hints, &result);
+        if (iResult != 0) {
+            printf("getaddrinfo failed with error: %d\n", iResult);
+            WSACleanup();
+            return ERROR;
+        }
+
+        m_socket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+        if (m_socket != INVALID_SOCKET) {
+            iResult = connect(m_socket, result->ai_addr, (int)result->ai_addrlen);
+            if (iResult == SOCKET_ERROR) {
+                closesocket(m_socket);
+                m_socket = INVALID_SOCKET;
+            }
+        }
+
+        if (m_socket == INVALID_SOCKET) {
+            m_pipe = CreateFileA("\\\\?\\pipe\\vysor-camera", GENERIC_READ,
+                0, NULL, OPEN_EXISTING, 0, NULL);
+            if (m_pipe == INVALID_HANDLE_VALUE) {
+                return ERROR_RETRY;
+            }
+            DWORD dwMode = PIPE_READMODE_MESSAGE;
+
+            SetNamedPipeHandleState(
+                m_pipe,    // pipe handle 
+                &dwMode,  // new pipe mode 
+                NULL,     // don't set maximum bytes 
+                NULL);    // don't set maximum time
+        }
     }
 
     BYTE* pData;
@@ -114,7 +161,7 @@ HRESULT CVCamStream::FillBuffer(IMediaSample *pms)
 
     //while (true) {
         DWORD length;
-        if (!ReadFully(m_pipe, (byte*)&length, 4)) {
+        if (!ReadFully((byte*)&length, 4)) {
             CloseHandle(m_pipe);
             m_pipe = INVALID_HANDLE_VALUE;
             return ERROR;
@@ -122,7 +169,7 @@ HRESULT CVCamStream::FillBuffer(IMediaSample *pms)
 
         length = htonl(length);
         int header[2];
-        if (!ReadFully(m_pipe, header, 8)) {
+        if (!ReadFully(header, 8)) {
             CloseHandle(m_pipe);
             m_pipe = INVALID_HANDLE_VALUE;
             return ERROR;
@@ -130,7 +177,7 @@ HRESULT CVCamStream::FillBuffer(IMediaSample *pms)
         int pts = htonl(header[0]);
         bool syncFrame = header[1];
 
-        if (!ReadFully(m_pipe, pData, length - 8)) {
+        if (!ReadFully(pData, length - 8)) {
             CloseHandle(m_pipe);
             m_pipe = INVALID_HANDLE_VALUE;
             return ERROR;
@@ -243,13 +290,12 @@ HRESULT CVCamStream::GetMediaType(CMediaType* pMediaType)
 
     VIDEOINFOHEADER2* pvi2 = &mpeg2->hdr;
     pvi2->bmiHeader.biBitCount = 24;
-    pvi2->bmiHeader.biSize = 40;
     pvi2->bmiHeader.biPlanes = 1;
     pvi2->bmiHeader.biWidth = uiWidth;
     pvi2->bmiHeader.biHeight = uiHeight;
-    pvi2->bmiHeader.biSize = 40;
+    pvi2->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     pvi2->bmiHeader.biSizeImage = DIBSIZE(pvi2->bmiHeader);
-    pvi2->bmiHeader.biCompression = DWORD('1CVA');
+    pvi2->bmiHeader.biCompression = BI_RGB;
     //pvi2->AvgTimePerFrame = m_tFrame;
     //pvi2->AvgTimePerFrame = 1000000;
     const REFERENCE_TIME FPS_25 = UNITS / 25;
@@ -348,7 +394,7 @@ HRESULT STDMETHODCALLTYPE CVCamStream::GetStreamCaps(int iIndex, AM_MEDIA_TYPE *
     mpeg2->dwFlags = 4;
 
     VIDEOINFOHEADER2* pvi = &mpeg2->hdr;
-    pvi->bmiHeader.biCompression = DWORD('1CVA');
+    pvi->bmiHeader.biCompression = BI_RGB;
     pvi->bmiHeader.biBitCount = 24;
     pvi->bmiHeader.biSize = 1080 * 2280 * 3;
     pvi->bmiHeader.biSize = 40;

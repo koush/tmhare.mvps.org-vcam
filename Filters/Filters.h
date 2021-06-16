@@ -64,7 +64,9 @@ public:
     //HRESULT GetMediaType(int iPosition, CMediaType *pmt);
     //HRESULT SetMediaType(const CMediaType *pmt);
     HRESULT OnThreadCreate(void);
-    
+
+    BOOLEAN ReadFully(void* buffer, int length);
+
 private:
     CVCam *m_pParent;
     REFERENCE_TIME m_rtLastTime;
@@ -72,6 +74,7 @@ private:
     CCritSec m_cSharedState;
     IReferenceClock *m_pClock;
     HANDLE m_pipe;
+    SOCKET m_socket;
     bool m_first;
 };
 
